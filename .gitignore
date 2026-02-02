@@ -48,3 +48,6 @@ Thumbs.db
 *.mov
 *.wmv
 
+# files added bt kalelo to prevent his uv files from being uploaded
+pyproject.toml
+.python-version
