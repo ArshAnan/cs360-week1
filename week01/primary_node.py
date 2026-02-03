@@ -25,7 +25,10 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Tuple
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
+
+from primes_in_range import get_primes
 
 
 class Registry:
@@ -151,7 +154,7 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
             raise RuntimeError(f"node {node['node_id']} error: {resp}")
         
         node_elapsed_s = float(resp.get("elapsed_seconds", 0.0))
-        print(f"Node ID: {node["node_id"]} completed in: {node_elapsed_s}")
+        print(f"Node ID: {node['node_id']} completed in: {node_elapsed_s}")
 
         return {
             "node_id": node["node_id"],
@@ -166,10 +169,21 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
             "primes_truncated": bool(resp.get("primes_truncated", False)),
         }
 
+    failed_slices: List[Tuple[int, int]] = []
+    nodes_failed: List[str] = []
+
     with ThreadPoolExecutor(max_workers=min(32, len(nodes_sorted))) as ex:
-        futs = [ex.submit(call_node, node, sl) for node, sl in zip(nodes_sorted, slices)]
+        task_list = list(zip(nodes_sorted, slices))
+        futs = {ex.submit(call_node, node, sl): (node, sl) for node, sl in task_list}
         for f in as_completed(futs):
-            per_node_results.append(f.result())
+            node, sl = futs[f]
+            try:
+                per_node_results.append(f.result())
+            except (URLError, HTTPError, TimeoutError, OSError, RuntimeError) as e:
+                failed_slices.append(sl)
+                if node["node_id"] not in nodes_failed:
+                    nodes_failed.append(node["node_id"])
+                print(f"[primary_node] Node {node['node_id']} failed for slice {sl}: {e}")
 
     per_node_results.sort(key=lambda r: r["slice"][0])
 
@@ -188,6 +202,24 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
             if r.get("primes_truncated"):
                 primes_truncated = True
 
+    # Reassign failed slices: compute on primary (graceful degradation)
+    if failed_slices:
+        for sl_low, sl_high in failed_slices:
+            res = get_primes(sl_low, sl_high, return_list=(mode == "list"))
+            if mode == "count":
+                total_primes += int(res)
+            else:
+                ps = list(res)
+                if ps:
+                    max_prime = max(max_prime, int(ps[-1]))
+                if len(primes_sample) < max_return_primes:
+                    remaining = max_return_primes - len(primes_sample)
+                    primes_sample.extend(ps[:remaining])
+                    if len(ps) > remaining:
+                        primes_truncated = True
+                else:
+                    primes_truncated = True
+
     t1 = time.perf_counter()
 
     resp: Dict[str, Any] = {
@@ -204,6 +236,9 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
         "sum_node_compute_seconds": sum(float(r["node_elapsed_s"]) for r in per_node_results),
         "sum_node_round_trip_seconds": sum(float(r["round_trip_s"]) for r in per_node_results),
     }
+    if nodes_failed:
+        resp["nodes_failed"] = nodes_failed
+        resp["reassigned"] = True
 
     if mode == "list":
         resp["primes"] = primes_sample

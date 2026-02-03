@@ -102,6 +102,13 @@ def main(argv: list[str]) -> int:
             print(f"Distributed error: {resp}", file=sys.stderr)
             return 1
 
+        if resp.get("nodes_failed") or resp.get("reassigned"):
+            failed = resp.get("nodes_failed", [])
+            print(
+                f"Warning: the following nodes failed and work was reassigned to the primary: {failed}",
+                file=sys.stderr,
+            )
+
         if args.mode == "count":
             print(int(resp.get("total_primes", 0)))
         else:
