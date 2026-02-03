@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from platform import node
 import threading
 import time
 import urllib.request
@@ -142,17 +143,31 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
             "include_per_chunk": False,
         }
         req = {k: v for k, v in req.items() if v is not None}
+        max_retries = 3
+        for attempt in range(max_retries): #retry 3 time before giving up
+            try: #fix:    print(f"Node ID: {node["node_id"]} completed in: {node_elapsed_s}")
+                        
+                print(f"Attempt {attempt + 1}: Calling {node['node_id']} ...") #retry attempt log
+                t_call0 = time.perf_counter()
+                resp = _post_json(url, req, timeout_s=120) #reduced timeout for faster failure response
+                t_call1 = time.perf_counter()
+                if not resp.get("ok"):
+                    raise RuntimeError(f"node {node['node_id']} error: {resp}")
+                if resp.get("ok") == True: #check if response is ok
+                    print(f"SUCCESS! {node['node_id']} returned data!")
+                    break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    print(f"Attempt {attempt + 1} failed for {node['node_id']}: {e}. Retrying in {2 ** attempt} seconds...")
+                    time.sleep(2 ** attempt)  # time delay before next retry
+                else:
+                    print(f"FAILED! {node['node_id']} did not respond after {max_retries} attempts.")
+                    return None
 
-        t_call0 = time.perf_counter()
-        resp = _post_json(url, req, timeout_s=3600)
-        t_call1 = time.perf_counter()
-
-        if not resp.get("ok"):
-            raise RuntimeError(f"node {node['node_id']} error: {resp}")
         
         node_elapsed_s = float(resp.get("elapsed_seconds", 0.0))
-        print(f"Node ID: {node["node_id"]} completed in: {node_elapsed_s}")
-
+        print(f"Node ID: {node['node_id']} completed in: {node_elapsed_s}")
+        
         return {
             "node_id": node["node_id"],
             "node": {"host": host, "port": port, "cpu_count": node.get("cpu_count", 1)},
