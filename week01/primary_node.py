@@ -21,11 +21,15 @@ import argparse
 import json
 import threading
 import time
+import random  # CHANGE: used for jitter in retry backoff
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Tuple
 from urllib.parse import urlparse
+
+# CHANGE: Local fallback computation when no secondaries are available
+from primes_in_range import get_primes
 
 
 class Registry:
@@ -62,6 +66,19 @@ class Registry:
 
 REGISTRY = Registry(ttl_s=120)
 
+# CHANGE: Track secondary node health to gracefully handle partial failures.
+# Implements a simple circuit breaker (Chapter 8 concept): after repeated failures,
+# temporarily stop sending work to a node and retry slices elsewhere.
+_NODE_HEALTH_LOCK = threading.Lock()
+NODE_HEALTH: Dict[str, Dict[str, Any]] = {}  # node_id -> {"fail_count": int, "down_until": float}
+
+# Tunables (kept conservative for a class prototype)
+FAILURE_THRESHOLD = 2       # failures before we "trip" the circuit
+COOLDOWN_SECONDS = 20.0     # how long to avoid a failing node
+DEFAULT_NODE_TIMEOUT_S = 12 # per-request timeout to a secondary node
+MAX_SLICE_ATTEMPTS = 4      # retry a slice this many times before local fallback
+
+
 
 def _post_json(url: str, payload: Dict[str, Any], timeout_s: int = 60) -> Dict[str, Any]:
     data = json.dumps(payload).encode("utf-8")
@@ -89,6 +106,14 @@ def split_into_slices(low: int, high: int, n: int) -> List[Tuple[int, int]]:
 
 
 def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    CHANGE: Failure-tolerant distributed compute.
+
+    Concepts used from Petrov Ch.8 (Distributed Computing overview):
+    - Partial failures: one worker can crash without failing the whole request.
+    - Timeouts + retries: detect suspected failure via timeout/connection errors and retry elsewhere.
+    - Circuit breaker + backoff/jitter: avoid hammering unhealthy nodes and causing cascading failures.
+    """
     low = int(payload["low"])
     high = int(payload["high"])
     if high <= low:
@@ -97,7 +122,7 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     mode = str(payload.get("mode", "count"))
     if mode not in ("count", "list"):
         raise ValueError("mode must be 'count' or 'list'")
-    
+
     sec_exec = str(payload.get("secondary_exec", "processes"))
     if sec_exec not in ("single", "threads", "processes"):
         raise ValueError("secondary_exec must be single|threads|processes")
@@ -109,25 +134,78 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     max_return_primes = int(payload.get("max_return_primes", 5000))
     include_per_node = bool(payload.get("include_per_node", False))
 
-    nodes = REGISTRY.active_nodes()
-    if not nodes:
-        raise ValueError("no active secondary nodes registered")
-    
     chunk = int(payload.get("chunk", 500_000))
 
-    nodes_sorted = sorted(nodes, key=lambda n: n["node_id"])
-    slices = split_into_slices(low, high, len(nodes_sorted))
-    nodes_sorted = nodes_sorted[:len(slices)]
+    # CHANGE: timeout can be overridden by the client, but has a safe default.
+    node_timeout_s = int(payload.get("node_timeout_s", DEFAULT_NODE_TIMEOUT_S))
+
+    # Helper: circuit breaker checks
+    def _is_node_available(node_id: str) -> bool:
+        with _NODE_HEALTH_LOCK:
+            st = NODE_HEALTH.get(node_id)
+            if not st:
+                return True
+            return time.time() >= float(st.get("down_until", 0.0))
+
+    def _record_success(node_id: str) -> None:
+        with _NODE_HEALTH_LOCK:
+            NODE_HEALTH[node_id] = {"fail_count": 0, "down_until": 0.0}
+
+    def _record_failure(node_id: str) -> None:
+        with _NODE_HEALTH_LOCK:
+            st = NODE_HEALTH.get(node_id, {"fail_count": 0, "down_until": 0.0})
+            st["fail_count"] = int(st.get("fail_count", 0)) + 1
+            if st["fail_count"] >= FAILURE_THRESHOLD:
+                st["down_until"] = time.time() + COOLDOWN_SECONDS
+            NODE_HEALTH[node_id] = st
+
+    # Helper: local fallback. (Allowed by assignment: "gracefully handle failure".)
+    def _local_compute(sl_low: int, sl_high: int) -> Dict[str, Any]:
+        t0_local = time.perf_counter()
+        if mode == "count":
+            cnt = int(get_primes(sl_low, sl_high, return_list=False))
+            primes_list: List[int] | None = None
+            max_p = -1  # we do not compute max prime in count-only mode
+        else:
+            # CHANGE: for list mode we still need the *true* count; compute full list once,
+            # then truncate only the returned sample.
+            primes_full = list(get_primes(sl_low, sl_high, return_list=True))
+            cnt = len(primes_full)
+            max_p = primes_full[-1] if primes_full else -1
+            primes_list = primes_full[:max_return_primes]
+        t1_local = time.perf_counter()
+        return {
+            "node_id": "primary",
+            "node": {"host": "localhost", "port": -1, "cpu_count": 0},
+            "slice": [sl_low, sl_high],
+            "round_trip_s": 0.0,
+            "node_elapsed_s": t1_local - t0_local,
+            "node_sum_chunk_s": t1_local - t0_local,
+            "total_primes": cnt,
+            "max_prime": max_p,
+            "primes": primes_list,
+            "primes_truncated": (mode == "list" and int(cnt) > max_return_primes),  # CHANGE: true truncation flag
+            "fallback": True,
+        }
+
+    # CHANGE: choose number of slices based on current membership.
+    nodes = REGISTRY.active_nodes()
+    if not nodes:
+        # If no secondaries exist at all, compute locally.
+        slices = [(low, high)]
+    else:
+        nodes_sorted = sorted(nodes, key=lambda n: n["node_id"])
+        slices = split_into_slices(low, high, len(nodes_sorted))
 
     t0 = time.perf_counter()
 
-    per_node_results: List[Dict[str, Any]] = []
-    total_primes = 0
-    primes_sample: List[int] = []
-    primes_truncated = False
-    max_prime = -1
+    # Slice attempt tracking: avoids infinite loops if everything is down.
+    attempts: Dict[Tuple[int, int], int] = {tuple(sl): 0 for sl in slices}
+    pending: List[Tuple[int, int]] = [tuple(sl) for sl in slices]
+    completed: List[Dict[str, Any]] = []
 
-    def call_node(node: Dict[str, Any], sl: Tuple[int, int]) -> Dict[str, Any]:
+    def _call_node(node: Dict[str, Any], sl: Tuple[int, int]) -> Dict[str, Any]:
+        """Call a secondary node for a slice; raises on failure."""
         host = node["host"]
         port = node["port"]
         url = f"http://{host}:{port}/compute"
@@ -144,14 +222,15 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
         req = {k: v for k, v in req.items() if v is not None}
 
         t_call0 = time.perf_counter()
-        resp = _post_json(url, req, timeout_s=3600)
+        resp = _post_json(url, req, timeout_s=node_timeout_s)
         t_call1 = time.perf_counter()
 
         if not resp.get("ok"):
             raise RuntimeError(f"node {node['node_id']} error: {resp}")
-        
+
         node_elapsed_s = float(resp.get("elapsed_seconds", 0.0))
-        print(f"Node ID: {node["node_id"]} completed in: {node_elapsed_s}")
+        # CHANGE: fixed quotes above.
+        print(f"Node ID: {node['node_id']} completed in: {node_elapsed_s}")
 
         return {
             "node_id": node["node_id"],
@@ -166,16 +245,78 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
             "primes_truncated": bool(resp.get("primes_truncated", False)),
         }
 
-    with ThreadPoolExecutor(max_workers=min(32, len(nodes_sorted))) as ex:
-        futs = [ex.submit(call_node, node, sl) for node, sl in zip(nodes_sorted, slices)]
-        for f in as_completed(futs):
-            per_node_results.append(f.result())
+    # CHANGE: main scheduler loop: keep assigning pending slices to healthy nodes.
+    while pending:
+        # Refresh membership and filter by circuit breaker (and registry TTL).
+        nodes_now = sorted(REGISTRY.active_nodes(), key=lambda n: n["node_id"])
+        healthy_nodes = [n for n in nodes_now if _is_node_available(str(n["node_id"]))]
 
-    per_node_results.sort(key=lambda r: r["slice"][0])
+        if not healthy_nodes:
+            # No secondaries available -> local fallback for remaining slices.
+            for sl in pending:
+                completed.append(_local_compute(sl[0], sl[1]))
+            pending.clear()
+            break
 
-    for r in per_node_results:
+        # Assign up to one slice per available node for this "round".
+        round_pairs = list(zip(healthy_nodes, pending[: len(healthy_nodes)]))
+        pending = pending[len(round_pairs) :]
+
+        # Fire off calls concurrently.
+        with ThreadPoolExecutor(max_workers=min(32, len(round_pairs))) as ex:
+            fut_map = {ex.submit(_call_node, node, sl): (node, sl) for node, sl in round_pairs}
+
+            for fut in as_completed(fut_map):
+                node, sl = fut_map[fut]
+                node_id = str(node["node_id"])
+
+                try:
+                    r = fut.result()
+                    _record_success(node_id)
+                    completed.append(r)
+                except Exception as e:
+                    # CHANGE: Handle partial failure without crashing the whole job.
+                    _record_failure(node_id)
+
+                    # Track attempts per slice; after too many tries, fallback locally.
+                    attempts[sl] = attempts.get(sl, 0) + 1
+                    if attempts[sl] >= MAX_SLICE_ATTEMPTS:
+                        completed.append(_local_compute(sl[0], sl[1]))
+                    else:
+                        # Backoff + jitter to reduce retry storms/cascading failures.
+                        backoff = min(2.0, 0.25 * (2 ** (attempts[sl] - 1)))
+                        time.sleep(backoff + random.random() * 0.15)
+                        pending.append(sl)
+
+                    # Optional: include a failure record for debugging when requested.
+                    if include_per_node:
+                        completed.append({
+                            "node_id": node_id,
+                            "node": {"host": node["host"], "port": node["port"], "cpu_count": node.get("cpu_count", 1)},
+                            "slice": list(sl),
+                            "error": str(e),
+                            "ok": False,
+                        })
+
+    # Aggregate results (ignore failure-record-only entries that don't have totals).
+    completed.sort(key=lambda r: r.get("slice", [0])[0])
+
+    total_primes = 0
+    primes_sample: List[int] = []
+    primes_truncated = False
+    max_prime = -1
+
+    per_node_results: List[Dict[str, Any]] = []
+    for r in completed:
+        # skip failure-only debug entries
+        if "total_primes" not in r:
+            per_node_results.append(r)
+            continue
+
+        per_node_results.append(r)
         total_primes += int(r["total_primes"])
-        max_prime = max(max_prime, int(r["max_prime"]))
+        max_prime = max(max_prime, int(r.get("max_prime", -1)))
+
         if mode == "list" and r.get("primes") is not None:
             ps = list(r["primes"])
             if len(primes_sample) < max_return_primes:
@@ -194,15 +335,16 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
         "ok": True,
         "mode": mode,
         "range": [low, high],
-        "nodes_used": len(nodes_sorted),
+        "nodes_used": len([r for r in per_node_results if r.get("node_id") not in (None, "primary") and r.get("total_primes") is not None]),
         "secondary_exec": sec_exec,
         "secondary_workers": sec_workers,
         "chunk": chunk,
         "total_primes": total_primes,
         "max_prime": max_prime,
         "elapsed_seconds": t1 - t0,
-        "sum_node_compute_seconds": sum(float(r["node_elapsed_s"]) for r in per_node_results),
-        "sum_node_round_trip_seconds": sum(float(r["round_trip_s"]) for r in per_node_results),
+        "sum_node_compute_seconds": sum(float(r.get("node_elapsed_s", 0.0)) for r in per_node_results if r.get("total_primes") is not None),
+        "sum_node_round_trip_seconds": sum(float(r.get("round_trip_s", 0.0)) for r in per_node_results if r.get("total_primes") is not None),
+        "node_timeout_s": node_timeout_s,  # CHANGE: visible in response for debugging
     }
 
     if mode == "list":
@@ -214,6 +356,7 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
         resp["per_node"] = per_node_results
 
     return resp
+
 
 
 class Handler(BaseHTTPRequestHandler):
