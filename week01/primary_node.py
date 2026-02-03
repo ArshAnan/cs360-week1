@@ -145,12 +145,12 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
         req = {k: v for k, v in req.items() if v is not None}
         max_retries = 3
         for attempt in range(max_retries): #retry 3 time before giving up
-            try: #fix:    print(f"Node ID: {node["node_id"]} completed in: {node_elapsed_s}")
+            try:
                         
                 print(f"Attempt {attempt + 1}: Calling {node['node_id']} ...") #retry attempt log
-                t_call0 = time.perf_counter()
+                t_call0 = time.perf_counter() #start timer
                 resp = _post_json(url, req, timeout_s=120) #reduced timeout for faster failure response
-                t_call1 = time.perf_counter()
+                t_call1 = time.perf_counter() #end timer
                 if not resp.get("ok"):
                     raise RuntimeError(f"node {node['node_id']} error: {resp}")
                 if resp.get("ok") == True: #check if response is ok
@@ -161,8 +161,20 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
                     print(f"Attempt {attempt + 1} failed for {node['node_id']}: {e}. Retrying in {2 ** attempt} seconds...")
                     time.sleep(2 ** attempt)  # time delay before next retry
                 else:
-                    print(f"FAILED! {node['node_id']} did not respond after {max_retries} attempts.")
-                    return None
+                    print(f"FAILED! {node['node_id']} did not respond after {max_retries} attempts... Will now be switching to a working node.")
+                   
+                    working_nodes = []
+                    for n in nodes_sorted:
+                        if n["node_id"] != node["node_id"]: # checks that we don't retry the same failed node
+                            working_nodes.append(n) # add the working node to the list
+
+                    if working_nodes:
+                        new_node = working_nodes[0] # pick the first working node
+                        print(f"Switching to working node: {new_node['node_id']}")
+                        return call_node(new_node, sl) # recursive call to the working node
+                    else:
+                        print(f"FAILED! {node['node_id']} did not respond after {max_retries} attempts")
+                        return None
 
         
         node_elapsed_s = float(resp.get("elapsed_seconds", 0.0))
