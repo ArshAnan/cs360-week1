@@ -33,7 +33,7 @@ POST /compute
 
 Notes
 -----
-- Example of how to run from terminal: python3 week01/secondary_node.py --primary http://127.0.0.1:9200 --node-id kbrown
+- Example of how to run from terminal: uv run week01/secondary_node.py --primary http://127.0.0.1:9200 --node-id dekompiler
 - For classroom demos, use mode="count" for big ranges to avoid large payloads.
 - "threads" may not speed up CPU-bound work in CPython; "processes" usually will.
 """

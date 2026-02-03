@@ -121,11 +121,12 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     t0 = time.perf_counter()
 
-    per_node_results: List[Dict[str, Any]] = []
+
     total_primes = 0
     primes_sample: List[int] = []
     primes_truncated = False
     max_prime = -1
+
 
     def call_node(node: Dict[str, Any], sl: Tuple[int, int]) -> Dict[str, Any]:
         host = node["host"]
@@ -151,7 +152,7 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
             raise RuntimeError(f"node {node['node_id']} error: {resp}")
         
         node_elapsed_s = float(resp.get("elapsed_seconds", 0.0))
-        print(f"Node ID: {node["node_id"]} completed in: {node_elapsed_s}")
+        print(f"Node ID: {node['node_id']} completed in: {node_elapsed_s}")
 
         return {
             "node_id": node["node_id"],
@@ -165,11 +166,55 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
             "primes": resp.get("primes", None),
             "primes_truncated": bool(resp.get("primes_truncated", False)),
         }
+    
+    #  whoch nodes attempted which slice
+    used_nodes_per_slice = {i: set() for i in range(len(slices))}
+    # tasks to run
+    tasks = [(nodes_sorted[i], slices[i], i) for i in range(len(slices))]
+    # plaveholder for result submitted by each node
+    per_node_results = [None] * len(slices)
+    MAX_RETRIES = 3
 
-    with ThreadPoolExecutor(max_workers=min(32, len(nodes_sorted))) as ex:
-        futs = [ex.submit(call_node, node, sl) for node, sl in zip(nodes_sorted, slices)]
-        for f in as_completed(futs):
-            per_node_results.append(f.result())
+    for retry_round in range(MAX_RETRIES):
+        if not tasks:
+            break
+            
+        print(f"[primary_node] Round {retry_round + 1}: processing {len(tasks)} tasks")
+        
+        with ThreadPoolExecutor(max_workers=min(32, len(tasks))) as ex:
+            future_to_task = {
+                ex.submit(call_node, node, sl): (node, sl, slice_idx)
+                for node, sl, slice_idx in tasks
+            }
+            
+            failed_tasks = []
+            for f in as_completed(future_to_task.keys()):
+                node, sl, slice_idx = future_to_task[f]
+                used_nodes_per_slice[slice_idx].add(node["node_id"])
+                
+                try:
+                    result = f.result()
+                    per_node_results[slice_idx] = result
+
+                except Exception as e:
+                    print(f"Secondary Node {node['node_id']} failed on slice {slice_idx}: {e}")
+                    
+                    # Find alternative node for this slice
+                    available = [n for n in nodes if n["node_id"] not in used_nodes_per_slice[slice_idx]]
+                    if available:
+                        retry_node = available[0]
+                        failed_tasks.append((retry_node, sl, slice_idx))
+                        print(f"Secondary node will retry slice {slice_idx} with node {retry_node['node_id']}")
+                    else:
+                        print(f"No nodes left to retry slice {slice_idx}")
+                        raise RuntimeError(f"Failed to compute slice {slice_idx} after trying all available nodes")
+            
+            tasks = failed_tasks
+
+    # check if any slices still failed
+    if any(r is None for r in per_node_results):
+        failed_indices = [i for i, r in enumerate(per_node_results) if r is None]
+        raise RuntimeError(f"Failed to compute slices: {failed_indices}")
 
     per_node_results.sort(key=lambda r: r["slice"][0])
 
@@ -285,11 +330,12 @@ def main() -> None:
     REGISTRY = Registry(ttl_s=max(10, int(args.ttl)))
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"[primary_node] listening on http://{args.host}:{args.port}")
-    print("  GET  /health")
-    print("  GET  /nodes")
-    print("  POST /register")
-    print("  POST /compute")
+    # commented out because im using system_interface.py
+    # print(f"[primary_node] listening on http://{args.host}:{args.port}")
+    # print("  GET  /health")
+    # print("  GET  /nodes")
+    # print("  POST /register")
+    # print("  POST /compute")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

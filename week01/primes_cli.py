@@ -2,13 +2,16 @@
 """
 primes_cli.py
 
-Notes
+Notes (modified by kalelo :)
 -----
 - Examples of how to run from terminal: 
-python3 week01/primes_cli.py --low 0 --high 100_000_0000 --exec single --time --mode count
-python3 week01/primes_cli.py --low 0 --high 100_000_0000 --exec threads --time --mode count
-python3 week01/primes_cli.py --low 0 --high 100_000_0000 --exec processes --time --mode count
-python3 week01/primes_cli.py --low 0 --high 100_000_0000 --exec distributed --time --mode count --secondary-exec processes --primary http://127.0.0.1:9200
+uv run week01/primes_cli.py --low 0 --high 100_000_0000 --exec single --time --mode count
+uv run week01/primes_cli.py --low 0 --high 100_000_0000 --exec threads --time --mode count
+uv run week01/primes_cli.py --low 0 --high 100_000_0000 --exec processes --time --mode count
+uv run week01/primes_cli.py --low 0 --high 100_000_0000 --exec distributed --time --mode count --secondary-exec processes --primary http://127.0.0.1:9200
+
+My notes 
+The command for distributed has primary as at http://127.0.0.1:9200 because thats the route and port primary_node.py listens on
 """
 from __future__ import annotations
 
