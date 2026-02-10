@@ -1,0 +1,211 @@
+syntax = "proto3";
+
+package primes;
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+// Top-level mode: how the coordinator and workers should interpret the request.
+// Mirrors the existing "mode" field ("count" | "list").
+enum Mode {
+  MODE_COUNT = 0;
+  MODE_LIST  = 1;
+}
+
+// Execution mode inside a worker, mirroring "single" | "threads" | "processes".
+enum ExecMode {
+  EXEC_SINGLE    = 0;
+  EXEC_THREADS   = 1;
+  EXEC_PROCESSES = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Common / shared messages
+// ---------------------------------------------------------------------------
+
+// Metadata about a worker node as tracked by the coordinator.
+message Node {
+  string node_id      = 1;
+  string host         = 2;
+  int32  port         = 3;
+  int32  cpu_count    = 4;
+  double last_seen    = 5;
+  double registered_at = 6;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool   ok     = 1;
+  string status = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Worker service messages (secondary_node equivalents)
+// ---------------------------------------------------------------------------
+
+// Request for a worker to compute primes over a sub-range [low, high).
+// Fields mirror the existing /compute JSON payload for secondary_node.py.
+message ComputeRangeRequest {
+  int64 low   = 1;
+  int64 high  = 2;
+  Mode  mode  = 3;   // count or list
+
+  int64    chunk     = 4;
+  ExecMode exec_mode = 5;
+  int32    workers   = 6;  // 0 or unset means "use default"
+
+  int32 max_return_primes = 7;  // only used when mode == MODE_LIST
+  bool  include_per_chunk = 8;
+}
+
+// Lightweight per-chunk summary, used when include_per_chunk is true.
+message ChunkSummary {
+  int64  low         = 1;
+  int64  high        = 2;
+  double elapsed_s   = 3;
+  int64  prime_count = 4;
+  int64  max_prime   = 5;
+}
+
+// Response from a worker for a single [low, high) sub-range.
+// Mirrors compute_partitioned(...) result in secondary_node.py.
+message ComputeRangeResponse {
+  bool   ok    = 1;
+  string error = 2;  // optional human-readable error when ok == false
+
+  Mode  mode       = 3;
+  int64 range_low  = 4;
+  int64 range_high = 5;
+
+  int64    chunk     = 6;
+  ExecMode exec_mode = 7;
+  int32    workers   = 8;
+  int32    chunks    = 9;
+
+  int64  total_primes              = 10;
+  int64  max_prime                 = 11;
+  double elapsed_seconds           = 12;
+  double sum_chunk_compute_seconds = 13;
+
+  // Optional per-chunk summaries.
+  repeated ChunkSummary per_chunk = 14;
+
+  // Optional list-mode fields, only populated when mode == MODE_LIST.
+  repeated int64 primes            = 15;
+  bool   primes_truncated          = 16;
+  int32  max_return_primes         = 17;
+
+  // For tracing which node produced this response.
+  string node_id                   = 18;
+}
+
+// ---------------------------------------------------------------------------
+// Coordinator service messages (primary_node equivalents)
+// ---------------------------------------------------------------------------
+
+// Registration request from a worker to the coordinator.
+// Mirrors the body sent to POST /register in primary_node.py.
+message RegisterNodeRequest {
+  string node_id   = 1;
+  string host      = 2;
+  int32  port      = 3;
+  int32  cpu_count = 4;
+  double ts        = 5;
+}
+
+message RegisterNodeResponse {
+  Node node = 1;
+}
+
+message ListNodesRequest {}
+
+message ListNodesResponse {
+  repeated Node nodes = 1;
+  int32 ttl_s         = 2;
+}
+
+// Per-node aggregated result that the coordinator returns to the CLI when
+// include_per_node is enabled.
+message PerNodeResult {
+  string node_id = 1;
+
+  int64 slice_low  = 2;
+  int64 slice_high = 3;
+
+  double round_trip_s     = 4;
+  double node_elapsed_s   = 5;
+  double node_sum_chunk_s = 6;
+
+  int64 total_primes = 7;
+  int64 max_prime    = 8;
+
+  repeated int64 primes    = 9;  // optional; only used in list mode
+  bool   primes_truncated  = 10;
+}
+
+// Top-level compute request sent from the CLI to the coordinator.
+// Mirrors the JSON payload used for /compute on primary_node.py.
+message ComputeRequest {
+  int64 low   = 1;
+  int64 high  = 2;
+  Mode  mode  = 3;
+
+  int64 chunk = 4;
+
+  ExecMode secondary_exec    = 5;
+  int32    secondary_workers = 6;
+
+  int32 max_return_primes = 7;
+  bool  include_per_node  = 8;
+}
+
+// Aggregated compute response returned from the coordinator to the CLI.
+// Mirrors distributed_compute(...) output in primary_node.py.
+message ComputeResponse {
+  bool   ok    = 1;
+  string error = 2;  // optional human-readable error for non-OK cases
+
+  Mode  mode       = 3;
+  int64 range_low  = 4;
+  int64 range_high = 5;
+
+  int32    nodes_used        = 6;
+  ExecMode secondary_exec    = 7;
+  int32    secondary_workers = 8;
+  int64    chunk             = 9;
+
+  int64  total_primes = 10;
+  int64  max_prime    = 11;
+
+  double elapsed_seconds             = 12;
+  double sum_node_compute_seconds    = 13;
+  double sum_node_round_trip_seconds = 14;
+
+  // Optional list-mode fields.
+  repeated int64 primes        = 15;
+  bool   primes_truncated      = 16;
+  int32  max_return_primes     = 17;
+
+  // Optional per-node breakdown, included when include_per_node is true.
+  repeated PerNodeResult per_node = 18;
+}
+
+// ---------------------------------------------------------------------------
+// Services
+// ---------------------------------------------------------------------------
+
+// Coordinator service (replaces primary_node HTTP endpoints).
+service CoordinatorService {
+  rpc RegisterNode (RegisterNodeRequest) returns (RegisterNodeResponse);
+  rpc ListNodes    (ListNodesRequest)    returns (ListNodesResponse);
+  rpc Compute      (ComputeRequest)      returns (ComputeResponse);
+}
+
+// Worker service (replaces secondary_node HTTP endpoints).
+service WorkerService {
+  rpc ComputeRange (ComputeRangeRequest) returns (ComputeRangeResponse);
+  rpc Health       (HealthRequest)       returns (HealthResponse);
+}
+
