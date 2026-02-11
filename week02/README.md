@@ -162,3 +162,125 @@ python -m unittest test_primes_grpc.py
 ```
 
 Make sure you have installed the gRPC dependencies and generated `primes_pb2.py` / `primes_pb2_grpc.py` before running the tests.
+
+
+
+
+GPT-5.1
+
+Here’s how to run the **full system** (primary + workers + CLI) and confirm it works end-to-end.
+
+---
+
+### 1. Install dependencies
+
+```bash
+python -m pip install grpcio grpcio-tools protobuf
+```
+
+If `primary_node.py` uses `grpc_status` / `google.rpc`, also:
+
+```bash
+python -m pip install grpcio-status googleapis-common-protos
+```
+
+---
+
+### 2. Generate protobuf stubs (if needed)
+
+From the **week02** directory:
+
+```bash
+cd week02
+python -m grpc_tools.protoc -I./proto --python_out=. --grpc_python_out=. ./proto/primes.proto
+```
+
+---
+
+### 3. Start the coordinator (primary)
+
+In **Terminal 1**, from the **week02** directory:
+
+```bash
+cd week02
+python primary_node.py --host 127.0.0.1 --port 9200 --grpc-port 50050
+```
+
+Leave this running. You should see something like:
+
+- `HTTP listening on http://127.0.0.1:9200`
+- `gRPC listening on 127.0.0.1:50050`
+
+---
+
+### 4. Start workers (secondaries)
+
+In **Terminal 2** (worker 1):
+
+```bash
+cd week02
+python secondary_node.py --host 127.0.0.1 --port 9100 --grpc-port 50051 --coordinator-grpc 127.0.0.1:50050 --node-id worker1
+```
+
+In **Terminal 3** (worker 2, optional but good for a real distributed check):
+
+```bash
+cd week02
+python secondary_node.py --host 127.0.0.1 --port 9101 --grpc-port 50052 --coordinator-grpc 127.0.0.1:50050 --node-id worker2
+```
+
+Leave both running. In Terminal 1 you should see log lines like “registered node: worker1” (and worker2 if you started the second).
+
+---
+
+### 5. Run the CLI (distributed mode)
+
+In **Terminal 4**, from **week02**:
+
+**Count mode (quick check):**
+
+```bash
+cd week02
+python primes_cli.py --low 0 --high 100000 --mode count --exec distributed --primary 127.0.0.1:50050 --secondary-exec processes --time
+```
+
+You should get a single number (prime count) and, with `--time`, elapsed time on stderr.
+
+**List mode (small range):**
+
+```bash
+python primes_cli.py --low 0 --high 200 --mode list --exec distributed --primary 127.0.0.1:50050 --secondary-exec processes --max-print 20 --time
+```
+
+**With per-node summary:**
+
+```bash
+python primes_cli.py --low 0 --high 50000 --mode count --exec distributed --primary 127.0.0.1:50050 --secondary-exec processes --time --include-per-node
+```
+
+You should see “Per-node summary” lines on stderr showing each worker’s slice and timings.
+
+---
+
+### 6. Sanity checks
+
+- **Count vs local:** Run the same range locally and compare:
+
+  ```bash
+  python primes_cli.py --low 0 --high 100000 --mode count --exec single
+  ```
+
+  The number should match the distributed run.
+
+- **Two workers:** If you started two workers, the `--time` / per-node output should show `nodes_used=2` and two per-node lines.
+
+---
+
+### 7. Shut down
+
+- In Terminals 2 and 3: `Ctrl+C` on each worker.
+- In Terminal 1: `Ctrl+C` on the primary.
+
+---
+
+**Summary:** Start primary (gRPC on 50050), start one or two workers with `--coordinator-grpc 127.0.0.1:50050`, then run `primes_cli.py --exec distributed --primary 127.0.0.1:50050` from `week02`. If those commands complete and the counts match local runs, the program as a whole is working.
