@@ -32,9 +32,10 @@ def convert_exec_mode(mode: str) -> primes_pb2.ExecMode:
         return primes_pb2.EXEC_SINGLE
     elif mode == "threads":
         return primes_pb2.EXEC_THREADS
-    else:
+    elif mode == "processes":
         return primes_pb2.EXEC_PROCESSES
-
+    else:
+        raise ValueError(f"Invalid exec mode: {mode}") #to handle invalid execution mode inputs
     
 
 
