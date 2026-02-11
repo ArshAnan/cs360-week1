@@ -18,9 +18,24 @@ import os
 import sys
 import time
 import urllib.request
+import grpc 
+import primes_pb2
+import primes_pb2_grpc
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 from primes_in_range import get_primes
+
+
+#convert exec mode string to primes_pb2.ExecMode enum to be used in the gRPC request
+def convert_exec_mode(mode: str) -> primes_pb2.ExecMode:
+    if mode == "single":
+        return primes_pb2.EXEC_SINGLE
+    elif mode == "threads":
+        return primes_pb2.EXEC_THREADS
+    else:
+        return primes_pb2.EXEC_PROCESSES
+
+    
 
 
 def iter_ranges(low: int, high: int, chunk: int) -> List[Tuple[int, int]]:
@@ -42,12 +57,7 @@ def _work_chunk(args: Tuple[int, int, bool]) -> Tuple[int, int, object]:
     return (a, b, res)
 
 
-def _post_json(url: str, payload: dict, timeout_s: int = 3600) -> dict:
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="POST")
-    req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+
 
 
 def main(argv: list[str]) -> int:
@@ -94,9 +104,43 @@ def main(argv: list[str]) -> int:
             "max_return_primes": args.max_return_primes,
             "include_per_node": args.include_per_node,
         }
-        url = args.primary.rstrip("/") + "/compute"
-        resp = _post_json(url, payload, timeout_s=3600)
+        target=args.primary.replace("http://", "").rstrip("/") # Remove http:// and trailing slash if present to get the host:port for gRPC channel
+        try:
+
+            channel = grpc.insecure_channel(target) # crete gRPC channel 
+            stub = primes_pb2_grpc.CoordinatorServiceStub(channel) # create gRPC stub for Coordinator service
+
+            request = primes_pb2.ComputeRequest( #request mimicking the ComputeRequest message defined in primes.proto, using the command-line arguments
+                low=int(payload["low"]),
+                high=int(payload["high"]),
+                mode=primes_pb2.MODE_COUNT if payload["mode"] == "count" else primes_pb2.MODE_LIST,
+                chunk=int(payload.get("chunk")),
+                secondary_exec=convert_exec_mode(payload.get("secondary_exec", "processes")),
+                secondary_workers=payload.get("secondary_workers") or 0,  
+                max_return_primes=int(payload.get("max_return_primes")),
+                include_per_node=bool(payload.get("include_per_node"))
+            )
+
+            response = stub.Compute(request, timeout=3600) #
+            resp = { #convert the gRPC response to a dictionary for easier handling later in the code
+                "ok": response.ok,
+                "error": response.error,
+                "total_primes": response.total_primes,
+                "max_prime": response.max_prime,
+                "primes": list(response.primes),
+                "primes_truncated": response.primes_truncated,
+                "nodes_used": response.nodes_used,
+                "per_node": response.per_node,
+                "elapsed_seconds": response.elapsed_seconds
+            }
+
+            channel.close()
+        except grpc.RpcError as e: #incase of connection issues or server errors check for gRPC errors
+            print(f"gRPC error: {e.details()}", file=sys.stderr)
+            return 1
+        
         t1 = time.perf_counter()
+
 
         if not resp.get("ok"):
             print(f"Distributed error: {resp}", file=sys.stderr)
@@ -122,10 +166,10 @@ def main(argv: list[str]) -> int:
             )
             if args.include_per_node and "per_node" in resp:
                 print("Per-node summary:", file=sys.stderr)
-                for r in resp["per_node"]:
+                for node in resp["per_node"]:
                     print(
-                        f"  {r['node_id']:>12} slice={r['slice']} primes={r['total_primes']} "
-                        f"node_elapsed={r['node_elapsed_s']:.3f}s round_trip={r['round_trip_s']:.3f}s",
+                        f"{node.node_id:>12}: primes={node.total_primes}"
+                        f"node_elapsed={node.node_elapsed_s:.3f}s round_trip={node.round_trip_s:.3f}s",
                         file=sys.stderr,
                     )
         return 0
