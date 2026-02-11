@@ -52,6 +52,159 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Tuple
 from urllib.parse import urlparse
 from primes_in_range import get_primes
+import primes_pb2
+import primes_pb2_grpc
+import grpc
+
+
+# worker service implementation
+class WorkerService(primes_pb2_grpc.WorkerService):
+    def ComputeRange(self, request, context):
+        """
+        Perform partitioned computation over [low, high) using get_primes per chunk.
+        """
+        # kalelo here:
+        # this is more a less a copy and paste of the prof's `compute_partitioned` function.
+        # I could've easily prefixed each var with `request.` but i think 
+        # unpacking all the values into vars keeps the code closer to the profesor's original
+        # code which may help us in debugging later
+        low = request.low
+        high = request.high
+        
+        # converting protobuf enums to strings for compatibility with existing code
+        mode_enum = request.mode
+        if mode_enum == primes_pb2.MODE_COUNT:
+            mode = "count"
+        elif mode_enum == primes_pb2.MODE_LIST:
+            mode = "list"
+        else:
+            raise ValueError(f"invalid mode enum: {mode_enum}")
+        
+        exec_enum = request.exec_mode
+        if exec_enum == primes_pb2.EXEC_SINGLE:
+            exec_mode = "single"
+        elif exec_enum == primes_pb2.EXEC_THREADS:
+            exec_mode = "threads"
+        elif exec_enum == primes_pb2.EXEC_PROCESSES:
+            exec_mode = "processes"
+        else:
+            raise ValueError(f"invalid exec_mode enum: {exec_enum}")
+        
+        chunk = request.chunk
+        workers = request.workers
+        max_return_primes = request.max_return_primes
+        include_per_chunk = request.include_per_chunk
+
+        if high <= low:
+            raise ValueError("high must be > low")
+
+        if workers is None or workers == 0:
+            workers = os.cpu_count() or 4
+        workers = max(1, int(workers))
+
+        ranges = iter_ranges(low, high, chunk)
+        want_list = (mode == "list")
+
+        t0 = time.perf_counter()
+        chunk_results: List[Dict[str, Any]] = []
+
+        if exec_mode == "single":
+            for a, b in ranges:
+                chunk_results.append(_work_chunk((a, b, want_list)))
+
+        elif exec_mode == "threads":
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = [ex.submit(_work_chunk, (a, b, want_list)) for a, b in ranges]
+                for f in as_completed(futs):
+                    chunk_results.append(f.result())
+
+        else:  # processes
+            with ProcessPoolExecutor(max_workers=workers) as ex:
+                futs = [ex.submit(_work_chunk, (a, b, want_list)) for a, b in ranges]
+                for f in as_completed(futs):
+                    chunk_results.append(f.result())
+
+        t1 = time.perf_counter()
+
+        chunk_results.sort(key=lambda d: int(d["low"]))
+        total_primes = sum(int(d["prime_count"]) for d in chunk_results)
+        sum_chunk = sum(float(d["elapsed_s"]) for d in chunk_results)
+
+        primes_out: List[int] | None = None
+        truncated = False
+        max_prime = -1
+
+        if want_list:
+            primes_out = []
+            for d in chunk_results:
+                ps = d.get("primes") or []
+                if ps:
+                    max_prime = max(max_prime, int(ps[-1]))
+                if len(primes_out) < max_return_primes:
+                    remaining = max_return_primes - len(primes_out)
+                    primes_out.extend(ps[:remaining])
+                    if len(ps) > remaining:
+                        truncated = True
+                else:
+                    truncated = True
+
+        # Convert string mode/exec_mode back to protobuf enums for response
+        if mode == "count":
+            mode_response = primes_pb2.MODE_COUNT
+        else:
+            mode_response = primes_pb2.MODE_LIST
+        
+        if exec_mode == "single":
+            exec_response = primes_pb2.EXEC_SINGLE
+        elif exec_mode == "threads":
+            exec_response = primes_pb2.EXEC_THREADS
+        else:
+            exec_response = primes_pb2.EXEC_PROCESSES
+        
+        # Build the protobuf response
+        response = primes_pb2.ComputeRangeResponse(
+            ok=True,
+            mode=mode_response,
+            range_low=low,
+            range_high=high,
+            chunk=chunk,
+            exec_mode=exec_response,
+            workers=workers if exec_mode != "single" else 1,
+            chunks=len(ranges),
+            total_primes=total_primes,
+            max_prime=max_prime,
+            elapsed_seconds=t1 - t0,
+            sum_chunk_compute_seconds=sum_chunk
+        )
+
+        # adding per-chunk details if requested
+        if include_per_chunk:
+            for d in chunk_results:
+                chunk_info = response.per_chunk.add()
+                chunk_info.low = d["low"]
+                chunk_info.high = d["high"]
+                chunk_info.elapsed_s = d["elapsed_s"]
+                chunk_info.prime_count = d["prime_count"]
+                chunk_info.max_prime = d.get("max_prime", -1)
+
+        # adding prime list if requested
+        if primes_out is not None:
+            response.primes.extend(primes_out)
+            response.primes_truncated = truncated
+            response.max_return_primes = max_return_primes
+
+        return response
+
+    def Health(self, request, context):
+        """
+        Simple health check endpoint for gRPC.
+        """
+        return primes_pb2.HealthResponse(
+            ok=True,
+            status="healthy"
+        )
+
+
 
 
 # ----------------------------
@@ -248,6 +401,7 @@ def start_registration_loop(
 ) -> None:
     """
     Background heartbeat: periodically re-register so primary can expire stale nodes.
+    HTTP version (legacy).
     """
     reg_url = primary_url.rstrip("/") + "/register"
     payload = {
@@ -271,6 +425,37 @@ def start_registration_loop(
 
     th = threading.Thread(target=loop, daemon=True)
     th.start()
+
+
+def register_with_coordinator_grpc(
+    coordinator_address: str,
+    node_id: str,
+    host: str,
+    port: int,
+) -> None:
+    """
+    Register this worker node with the coordinator via gRPC.
+    This is a one-time registration call on startup.
+    """
+    try:
+        channel = grpc.insecure_channel(coordinator_address)
+        stub = primes_pb2_grpc.CoordinatorServiceStub(channel)
+        
+        request = primes_pb2.RegisterNodeRequest(
+            node_id=node_id,
+            host=host,
+            port=port,
+            cpu_count=os.cpu_count() or 1,
+            ts=time.time()
+        )
+        
+        response = stub.RegisterNode(request, timeout=5)
+        print(f"[secondary_node] registered with coordinator: {response.node.node_id}")
+        channel.close()
+    except Exception as e:
+        print(f"[secondary_node] warning: failed to register with coordinator via gRPC: {e}")
+        print(f"[secondary_node] continuing anyway; coordinator may be unavailable")
+
 
 
 # ----------------------------
@@ -356,12 +541,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Secondary prime worker node (HTTP server).")
+    ap = argparse.ArgumentParser(description="Secondary prime worker node (HTTP + gRPC server).")
     ap.add_argument("--host", default="127.0.0.1", help="Bind host (default 127.0.0.1).")
-    ap.add_argument("--port", type=int, default=9100, help="Bind port (default 9100).")
+    ap.add_argument("--port", type=int, default=9100, help="HTTP bind port (default 9100).")
+    ap.add_argument("--grpc-port", type=int, default=50051, help="gRPC bind port (default 50051).")
     ap.add_argument("--node-id", default=None, help="Optional stable node id (default: hostname).")
 
     ap.add_argument("--primary", default=None, help="Primary coordinator URL, e.g. http://134.74.160.1:9200")
+    ap.add_argument("--coordinator-grpc", default=None, help="Coordinator gRPC address, e.g. 127.0.0.1:50050")
     ap.add_argument("--public-host", default=None, help="Host/IP to advertise to primary (default: auto-detect).")
     ap.add_argument("--register-interval", type=int, default=3600, help="Seconds between heartbeats (default 3600).")
 
@@ -379,12 +566,24 @@ def main() -> None:
         "node_id": node_id,
         "bind_host": args.host,
         "bind_port": args.port,
+        "grpc_port": args.grpc_port,
         "advertised_host": advertised_host,
         "advertised_port": args.port,
+        "advertised_grpc_port": args.grpc_port,
         "cpu_count": os.cpu_count() or 1,
         "registered_to": args.primary,
     })
 
+    # Register with coordinator via gRPC if address provided
+    if args.coordinator_grpc:
+        register_with_coordinator_grpc(
+            args.coordinator_grpc,
+            node_id=node_id,
+            host=advertised_host,
+            port=args.grpc_port,  # Register gRPC port, not HTTP port
+        )
+
+    # Legacy HTTP registration loop (if using HTTP-based primary)
     if args.primary:
         start_registration_loop(
             args.primary,
@@ -394,22 +593,38 @@ def main() -> None:
             interval_s=max(5, int(args.register_interval)),
         )
 
+    # Start gRPC server in background thread
+    grpc_server = grpc.server(ThreadPoolExecutor(max_workers=10))
+    primes_pb2_grpc.add_WorkerServiceServicer_to_server(WorkerService(), grpc_server)
+    grpc_server.add_insecure_port(f"{args.host}:{args.grpc_port}")
+    grpc_server.start()
+
+    # Start HTTP server (blocking)
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"[secondary_node] node_id={node_id}")
-    print(f"[secondary_node] listening on http://{args.host}:{args.port}")
-    print(f"[secondary_node] advertised as http://{advertised_host}:{args.port}")
+    print(f"[secondary_node] HTTP listening on http://{args.host}:{args.port}")
+    print(f"[secondary_node] gRPC listening on {args.host}:{args.grpc_port}")
+    print(f"[secondary_node] advertised as http://{advertised_host}:{args.port} (HTTP) and {advertised_host}:{args.grpc_port} (gRPC)")
     if args.primary:
-        print(f"[secondary_node] registering to primary: {args.primary}")
-    print("  GET  /health")
-    print("  GET  /info")
-    print("  POST /compute")
+        print(f"[secondary_node] registering to primary (HTTP): {args.primary}")
+    if args.coordinator_grpc:
+        print(f"[secondary_node] registered to coordinator (gRPC): {args.coordinator_grpc}")
+    print("  HTTP endpoints:")
+    print("    GET  /health")
+    print("    GET  /info")
+    print("    POST /compute")
+    print("  gRPC services:")
+    print("    WorkerService.ComputeRange")
+    print("    WorkerService.Health")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\n[secondary_node] KeyboardInterrupt received; shutting down gracefully...", flush=True)
         httpd.shutdown()
+        grpc_server.stop(grace=5)
     finally:
         httpd.server_close()
+        grpc_server.wait_for_termination(timeout=5)
         print("[secondary_node] server stopped.")
 
 
