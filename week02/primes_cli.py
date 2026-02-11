@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
 import grpc 
 import primes_pb2
@@ -74,7 +75,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--time", action="store_true")
 
     # Distributed options
-    ap.add_argument("--primary", default=None, help="Primary URL, e.g. http://134.74.160.1:9200")
+    ap.add_argument("--primary", default=None, help="Primary URL, e.g. http://127.0.0.1:9200 or 127.0.0.1:50050")
+    ap.add_argument("--protocol", choices=["grpc", "http"], default="grpc",
+                    help="Protocol to use for distributed compute (default: grpc).")
     ap.add_argument("--secondary-exec", choices=["single", "threads", "processes"], default="processes")
     ap.add_argument("--secondary-workers", type=int, default=None)
     ap.add_argument("--include-per-node", action="store_true")
@@ -93,6 +96,9 @@ def main(argv: list[str]) -> int:
             print("Error: --primary is required when --exec distributed", file=sys.stderr)
             return 2
 
+        protocol = args.protocol
+        print(f"[cli] Using protocol: {protocol.upper()}", file=sys.stderr)
+
         t0 = time.perf_counter()
         payload = {
             "low": args.low,
@@ -104,43 +110,65 @@ def main(argv: list[str]) -> int:
             "max_return_primes": args.max_return_primes,
             "include_per_node": args.include_per_node,
         }
-        target=args.primary.replace("http://", "").rstrip("/") # Remove http:// and trailing slash if present to get the host:port for gRPC channel
-        try:
 
-            channel = grpc.insecure_channel(target) # crete gRPC channel 
-            stub = primes_pb2_grpc.CoordinatorServiceStub(channel) # create gRPC stub for Coordinator service
+        if protocol == "grpc":
+            # ---- gRPC path ----
+            target = args.primary.replace("http://", "").rstrip("/")  # strip http:// to get host:port for gRPC channel
+            try:
+                channel = grpc.insecure_channel(target)  # create gRPC channel
+                stub = primes_pb2_grpc.CoordinatorServiceStub(channel)  # create gRPC stub for Coordinator service
 
-            request = primes_pb2.ComputeRequest( #request mimicking the ComputeRequest message defined in primes.proto, using the command-line arguments
-                low=int(payload["low"]),
-                high=int(payload["high"]),
-                mode=primes_pb2.MODE_COUNT if payload["mode"] == "count" else primes_pb2.MODE_LIST,
-                chunk=int(payload.get("chunk")),
-                secondary_exec=convert_exec_mode(payload.get("secondary_exec", "processes")),
-                secondary_workers=payload.get("secondary_workers") or 0,  
-                max_return_primes=int(payload.get("max_return_primes")),
-                include_per_node=bool(payload.get("include_per_node"))
-            )
+                request = primes_pb2.ComputeRequest(  # request mimicking the ComputeRequest message defined in primes.proto
+                    low=int(payload["low"]),
+                    high=int(payload["high"]),
+                    mode=primes_pb2.MODE_COUNT if payload["mode"] == "count" else primes_pb2.MODE_LIST,
+                    chunk=int(payload.get("chunk")),
+                    secondary_exec=convert_exec_mode(payload.get("secondary_exec", "processes")),
+                    secondary_workers=payload.get("secondary_workers") or 0,
+                    max_return_primes=int(payload.get("max_return_primes")),
+                    include_per_node=bool(payload.get("include_per_node")),
+                )
 
-            response = stub.Compute(request, timeout=3600) #
-            resp = { #convert the gRPC response to a dictionary for easier handling later in the code
-                "ok": response.ok,
-                "error": response.error,
-                "total_primes": response.total_primes,
-                "max_prime": response.max_prime,
-                "primes": list(response.primes),
-                "primes_truncated": response.primes_truncated,
-                "nodes_used": response.nodes_used,
-                "per_node": response.per_node,
-                "elapsed_seconds": response.elapsed_seconds
-            }
+                response = stub.Compute(request, timeout=3600)
+                resp = {  # convert gRPC response to a dictionary for uniform handling below
+                    "ok": response.ok,
+                    "error": response.error,
+                    "total_primes": response.total_primes,
+                    "max_prime": response.max_prime,
+                    "primes": list(response.primes),
+                    "primes_truncated": response.primes_truncated,
+                    "nodes_used": response.nodes_used,
+                    "per_node": response.per_node,
+                    "elapsed_seconds": response.elapsed_seconds,
+                }
 
-            channel.close()
-        except grpc.RpcError as e: #incase of connection issues or server errors check for gRPC errors
-            print(f"gRPC error: {e.details()}", file=sys.stderr)
-            return 1
-        
+                channel.close()
+            except grpc.RpcError as e:  # connection issues or server errors
+                print(f"gRPC error: {e.details()}", file=sys.stderr)
+                return 1
+
+        else:
+            # ---- HTTP path ----
+            primary_url = args.primary if args.primary.startswith("http") else f"http://{args.primary}"
+            primary_url = primary_url.rstrip("/")
+            url = f"{primary_url}/compute"
+
+            http_payload = {k: v for k, v in payload.items() if v is not None}
+            data = json.dumps(http_payload).encode("utf-8")
+            req = urllib.request.Request(url, data=data, method="POST")
+            req.add_header("Content-Type", "application/json")
+            try:
+                with urllib.request.urlopen(req, timeout=3600) as http_resp:
+                    resp = json.loads(http_resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                error_body = e.read().decode("utf-8", errors="replace")
+                print(f"HTTP error {e.code} {e.reason}: {error_body}", file=sys.stderr)
+                return 1
+            except Exception as e:
+                print(f"HTTP error: {e}", file=sys.stderr)
+                return 1
+
         t1 = time.perf_counter()
-
 
         if not resp.get("ok"):
             print(f"Distributed error: {resp}", file=sys.stderr)
@@ -161,17 +189,26 @@ def main(argv: list[str]) -> int:
         if args.time:
             print(
                 f"Elapsed seconds: {t1 - t0:.6f}  "
-                f"(exec=distributed, nodes_used={resp.get('nodes_used')}, secondary_exec={resp.get('secondary_exec')}, chunk={args.chunk})",
+                f"(exec=distributed, protocol={protocol.upper()}, nodes_used={resp.get('nodes_used')}, "
+                f"secondary_exec={resp.get('secondary_exec')}, chunk={args.chunk})",
                 file=sys.stderr,
             )
             if args.include_per_node and "per_node" in resp:
                 print("Per-node summary:", file=sys.stderr)
-                for node in resp["per_node"]:
-                    print(
-                        f"{node.node_id:>12}: primes={node.total_primes}"
-                        f"node_elapsed={node.node_elapsed_s:.3f}s round_trip={node.round_trip_s:.3f}s",
-                        file=sys.stderr,
-                    )
+                if protocol == "grpc":
+                    for node in resp["per_node"]:
+                        print(
+                            f"  {node.node_id:>12}: primes={node.total_primes}  "
+                            f"node_elapsed={node.node_elapsed_s:.3f}s  round_trip={node.round_trip_s:.3f}s",
+                            file=sys.stderr,
+                        )
+                else:
+                    for node in resp["per_node"]:
+                        print(
+                            f"  {node.get('node_id','?'):>12}: primes={node.get('total_primes',0)}  "
+                            f"node_elapsed={node.get('node_elapsed_s',0):.3f}s  round_trip={node.get('round_trip_s',0):.3f}s",
+                            file=sys.stderr,
+                        )
         return 0
 
     # Local paths
