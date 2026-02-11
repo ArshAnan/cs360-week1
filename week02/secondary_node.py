@@ -70,6 +70,7 @@ class WorkerService(primes_pb2_grpc.WorkerService):
         # code which may help us in debugging later
         low = request.low
         high = request.high
+        print(f"[secondary_node][gRPC] ComputeRange request received: [{low}, {high})")
         
         # converting protobuf enums to strings for compatibility with existing code
         mode_enum = request.mode
@@ -432,10 +433,13 @@ def register_with_coordinator_grpc(
     node_id: str,
     host: str,
     port: int,
+    http_port: int | None = None,
 ) -> None:
     """
     Register this worker node with the coordinator via gRPC.
     This is a one-time registration call on startup.
+    The HTTP port is passed via gRPC metadata so the coordinator
+    can reach this worker over HTTP as well.
     """
     try:
         channel = grpc.insecure_channel(coordinator_address)
@@ -448,8 +452,14 @@ def register_with_coordinator_grpc(
             cpu_count=os.cpu_count() or 1,
             ts=time.time()
         )
-        
-        response = stub.RegisterNode(request, timeout=5)
+
+        # Pass the HTTP port via gRPC metadata so the coordinator
+        # can store both ports and route HTTP requests correctly.
+        metadata = []
+        if http_port is not None:
+            metadata.append(('http-port', str(http_port)))
+
+        response = stub.RegisterNode(request, timeout=5, metadata=metadata)
         print(f"[secondary_node] registered with coordinator: {response.node.node_id}")
         channel.close()
     except Exception as e:
@@ -511,6 +521,8 @@ class Handler(BaseHTTPRequestHandler):
             high = int(payload["high"])
         except Exception:
             return self._send_json({"ok": False, "error": "payload must include integer low and high"}, code=400)
+
+        print(f"[secondary_node][HTTP] POST /compute request received: [{low}, {high})")
 
         mode = str(payload.get("mode", "count"))
         chunk = int(payload.get("chunk", 500_000))
@@ -581,6 +593,7 @@ def main() -> None:
             node_id=node_id,
             host=advertised_host,
             port=args.grpc_port,  # Register gRPC port, not HTTP port
+            http_port=args.port,  # Also pass HTTP port via metadata
         )
 
     # Legacy HTTP registration loop (if using HTTP-based primary)
