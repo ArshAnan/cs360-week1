@@ -2,18 +2,23 @@ syntax = "proto3";
 
 package primes;
 
-// ---------------------------------------------------------------------------
+// Arsh's work:
+
 // Enums
-// ---------------------------------------------------------------------------
+
 
 // Top-level mode: how the coordinator and workers should interpret the request.
-// Mirrors the existing "mode" field ("count" | "list").
+// Similar to the existing "mode" field ("count" | "list").
+// This is to simply convey which mode should be used. This is better than saying "count" or "list"
+// because it saves us bandwidth and is more type-safe.
 enum Mode {
   MODE_COUNT = 0;
   MODE_LIST  = 1;
 }
 
 // Execution mode inside a worker, mirroring "single" | "threads" | "processes".
+// The reasoning here is the same as above in enum Mode. We can have 3 execution modes
+// because we are dealing with a CPU-bound task, and this reduces the bandwidth and is more type-safe.
 enum ExecMode {
   EXEC_SINGLE    = 0;
   EXEC_THREADS   = 1;
