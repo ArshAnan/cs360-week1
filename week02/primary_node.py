@@ -45,10 +45,12 @@ class Registry:
     def upsert(self, node: Dict[str, Any]) -> Dict[str, Any]:
         node_id = str(node["node_id"])
         now = time.time()
+        port = int(node["port"])
         record = {
             "node_id": node_id,
             "host": str(node["host"]),
-            "port": int(node["port"]),
+            "port": port,
+            "http_port": int(node.get("http_port", port)),  # defaults to port if not provided
             "cpu_count": int(node.get("cpu_count", 1)),
             "last_seen": float(node.get("ts", now)),
             "registered_at": now,
@@ -137,6 +139,10 @@ class CoordinatorServiceImpl(primes_pb2_grpc.CoordinatorServiceServicer):
 
     # ---- RegisterNode ----
     def RegisterNode(self, request, context):
+        # Extract HTTP port from gRPC metadata if the worker sent it
+        metadata = dict(context.invocation_metadata())
+        http_port_str = metadata.get('http-port', None)
+
         node_dict = {
             "node_id": request.node_id,
             "host": request.host,
@@ -144,8 +150,12 @@ class CoordinatorServiceImpl(primes_pb2_grpc.CoordinatorServiceServicer):
             "cpu_count": request.cpu_count,
             "ts": request.ts,
         }
+        if http_port_str is not None:
+            node_dict["http_port"] = int(http_port_str)
+
         rec = REGISTRY.upsert(node_dict)
-        print(f"[primary_node][gRPC] registered node: {request.node_id}")
+        print(f"[primary_node][gRPC] registered node: {request.node_id} "
+              f"(grpc_port={request.port}, http_port={rec.get('http_port')})")
 
         node_msg = primes_pb2.Node(
             node_id=rec["node_id"],
@@ -468,7 +478,7 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     def call_node(node: Dict[str, Any], sl: Tuple[int, int]) -> Dict[str, Any]:
         host = node["host"]
-        port = node["port"]
+        port = node.get("http_port", node["port"])  # prefer HTTP port for HTTP calls
         url = f"http://{host}:{port}/compute"
         req = {
             "low": sl[0],
@@ -534,7 +544,12 @@ def distributed_compute(payload: Dict[str, Any]) -> Dict[str, Any]:
     with ThreadPoolExecutor(max_workers=min(32, len(nodes_sorted))) as ex:
         futs = [ex.submit(call_node, node, sl) for node, sl in zip(nodes_sorted, slices)]
         for f in as_completed(futs):
-            per_node_results.append(f.result())
+            result = f.result()
+            if result is not None:
+                per_node_results.append(result)
+
+    if not per_node_results:
+        raise ValueError("all worker nodes failed to respond")
 
     per_node_results.sort(key=lambda r: r["slice"][0])
 
