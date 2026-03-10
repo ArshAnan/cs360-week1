@@ -27,3 +27,8 @@ uv run  primes_cli.py --low 0 --high 1000000 --mode count --exec distributed \
   --primary http://127.0.0.1:9200 --protocol grpc --time
 
 ```
+
+### Running tests
+```bash
+uv run python -m unittest test_primes_grpc.py
+```
