@@ -3,13 +3,17 @@ Raft replica node. Implements the ReplicaAdmin gRPCservice.
 """
 
 import argparse
-from ast import parse
-from concurrent.futures import ThreadPoolExecutor
-from logging import RootLogger
 import sys
 from pathlib import Path
 import grpc
 from generated import replica_admin_pb2, replica_admin_pb2_grpc
+from dataclasses import dataclass
+from threading import Lock
+
+@dataclass
+class LogEntry:
+    term: int
+    data: bytes
 
 # Ensure we can import generated stubs
 
@@ -23,6 +27,21 @@ class ReplicaAdminServicer(replica_admin_pb2_grpc.ReplicaAdminServicer):
     def __init__(self, replica_id: int, host: str, port: int) -> None:
         self.replica_id = replica_id
         self.peer_addrs = self._peer_addrs(host, port)
+        self._lock = Lock()
+
+        # Persistent state
+        self.current_term = 1
+        self.voted_for: int | None = None
+        self.log: list[LogEntry] = [LogEntry(term=0, data=b"")] # index 0 is dummy entry
+
+        # Volatile State
+        self.commit_index = 0
+        self.last_applied = 0
+        self.role = replica_admin_pb2.FOLLOWER
+
+        # Leader only (populated when becoming leader)
+        self.next_index: dict[int, int] = {}
+        self.match_index: dict[int, int] = {}
 
     def _peer_addrs(self, host: str, port: int) -> list[str]:
         base_port = 50061
@@ -34,6 +53,11 @@ class ReplicaAdminServicer(replica_admin_pb2_grpc.ReplicaAdminServicer):
         return addrs
 
     def Status(self, request, context):
+        with self._lock:
+            last_idx = len(self.log) - 1
+            last_term = self.log[-1].term if self.log else 0
+            leader_hint = "" # TODO: set leader hint
+
         return replica_admin_pb2.StatusResponse(
             id=self.replica_id,
             role=replica_admin_pb2.FOLLOWER,
