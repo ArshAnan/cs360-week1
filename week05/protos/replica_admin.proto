@@ -3,6 +3,8 @@ package replica;
 
 service ReplicaAdmin {
   rpc Status(StatusRequest) returns (StatusResponse);
+  rpc SubmitMessage(SubmitMessageRequest) returns (SubmitMessageResponse);
+  rpc QueryConversation(QueryConversationRequest) returns (QueryConversationResponse);
 }
 
 message StatusRequest {}
@@ -21,4 +23,38 @@ message StatusResponse {
   int64 last_log_index = 5;
   uint64 last_log_term = 6;
   int64 commit_index = 7;
+}
+
+message SubmitMessageRequest {
+  string from_user = 1;
+  string to_user = 2;
+  string client_id = 3;
+  string client_msg_id = 4;
+  string text = 5;
+}
+
+message SubmitMessageResponse {
+  bool success = 1;
+  string leader_hint = 2;
+  uint64 seq = 3;
+}
+
+message QueryConversationRequest {
+  string user_a = 1;
+  string user_b = 2;
+  uint64 after_seq = 3;
+  uint32 limit = 4;
+}
+
+message ConversationEvent {
+  uint64 seq = 1;
+  string from_user = 2;
+  string text = 3;
+  int64 server_time_ms = 4;
+  string client_id = 5;
+  string client_msg_id = 6;
+}
+
+message QueryConversationResponse {
+  repeated ConversationEvent events = 1;
 }

@@ -52,3 +52,6 @@ Thumbs.db
 pyproject.toml
 .python-version
 uv.lock
+
+# kalelo's files
+week05_original

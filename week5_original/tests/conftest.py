@@ -94,17 +94,10 @@ def get_replica_statuses(replica_addrs: List[str]):
     _, _, rep_pb2, rep_grpc = import_stubs()
     statuses = []
     for addr in replica_addrs:
-        try:
-            ch = grpc.insecure_channel(addr, options=[
-                ("grpc.initial_reconnect_backoff_ms", 50),
-                ("grpc.max_reconnect_backoff_ms", 100),
-            ])
-            grpc.channel_ready_future(ch).result(timeout=0.4)
-            stub = rep_grpc.ReplicaAdminStub(ch)
-            resp = stub.Status(rep_pb2.StatusRequest(), timeout=0.5)
-            statuses.append((addr, resp))
-        except Exception:
-            continue
+        ch = wait_for_port(addr, timeout=5.0)
+        stub = rep_grpc.ReplicaAdminStub(ch)
+        resp = stub.Status(rep_pb2.StatusRequest(), timeout=2.0)
+        statuses.append((addr, resp))
     return statuses
 
 def pick_leader(statuses):
@@ -113,31 +106,10 @@ def pick_leader(statuses):
         return None
     return leaders[0]
 
-def _kill_port_holders(*ports):
-    """Best-effort kill of any process LISTENING on the given ports."""
-    import subprocess as _sp
-    for port in ports:
-        try:
-            out = _sp.check_output(
-                ["lsof", "-ti", f":{port}", "-sTCP:LISTEN"],
-                text=True, stderr=_sp.DEVNULL,
-            ).strip()
-            for pid_s in out.split():
-                try:
-                    import os as _os, signal as _sig
-                    _os.kill(int(pid_s), _sig.SIGKILL)
-                except (ValueError, OSError):
-                    pass
-        except _sp.CalledProcessError:
-            pass
-
 @pytest.fixture()
 def cluster():
     _ensure_scripts_exist()
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-
-    _kill_port_holders(50051, 50061, 50062, 50063, 50064, 50065)
-    time.sleep(0.5)
 
     proc = _run([sys.executable, str(SCRIPTS_DIR / "run_cluster.py")], cwd=ROOT, check=False)
     if proc.returncode != 0:
@@ -161,22 +133,9 @@ def cluster():
 
     yield data
 
-    # Aggressive cleanup: SIGKILL all known PIDs, then stop_cluster for good measure
-    import os as _os, signal as _sig
-    current = load_cluster() if CLUSTER_JSON.exists() else data
-    for r in current.get("replicas", []):
-        pid = r.get("pid")
-        if isinstance(pid, int):
-            try: _os.kill(pid, _sig.SIGKILL)
-            except OSError: pass
-    gw_pid = current.get("gateway", {}).get("pid")
-    if isinstance(gw_pid, int):
-        try: _os.kill(gw_pid, _sig.SIGKILL)
-        except OSError: pass
-
-    _run([sys.executable, str(SCRIPTS_DIR / "stop_cluster.py")], cwd=ROOT, check=False)
-    _kill_port_holders(50051, 50061, 50062, 50063, 50064, 50065)
-    time.sleep(1.5)
+    proc2 = _run([sys.executable, str(SCRIPTS_DIR / "stop_cluster.py")], cwd=ROOT, check=False)
+    if proc2.returncode != 0:
+        print(f"[teardown] stop_cluster.py failed:\nstdout:\n{proc2.stdout}\nstderr:\n{proc2.stderr}", file=sys.stderr)
 
 @pytest.fixture()
 def gateway_stub(cluster):

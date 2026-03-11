@@ -3,6 +3,7 @@ Raft replica node. Implements the ReplicaAdmin gRPC service.
 """
 
 import argparse
+import json
 import random
 import sys
 import threading
@@ -22,9 +23,9 @@ from generated import replica_admin_pb2, replica_admin_pb2_grpc
 from generated import raft_pb2, raft_pb2_grpc
 
 # ── Tuning constants ────────────────────────────────────────────────────────
-ELECTION_TIMEOUT_MIN = 0.15   # seconds (150 ms)
-ELECTION_TIMEOUT_MAX = 0.30   # seconds (300 ms)
-HEARTBEAT_INTERVAL   = 0.05   # seconds  (50 ms)
+ELECTION_TIMEOUT_MIN = 0.30   # seconds (300 ms)
+ELECTION_TIMEOUT_MAX = 0.60   # seconds (600 ms)
+HEARTBEAT_INTERVAL   = 0.10   # seconds (100 ms)
 MAJORITY             = 3      # out of 5 replicas
 RPC_TIMEOUT          = 0.1    # seconds for outgoing Raft RPCs
 
@@ -77,14 +78,27 @@ class ReplicaAdminServicer(replica_admin_pb2_grpc.ReplicaAdminServicer):
             ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX
         )
 
+        # ── Application state machine (built from committed log entries) ──────
+        self.conversations: dict[str, list[dict]] = {}
+        self.dedup_table: dict[tuple[str, str], int] = {}
+        self.seq_counters: dict[str, int] = {}
+
+        # SubmitMessage callers wait on these until their entry is committed
+        self._commit_events: dict[int, threading.Event] = {}
+        self._applied_results: dict[int, dict] = {}
+
         # Start background threads (daemon so they die with the process)
         threading.Thread(
             target=self._election_loop, daemon=True,
             name=f"election-{replica_id}"
         ).start()
         threading.Thread(
-            target=self._heartbeat_loop, daemon=True,
-            name=f"heartbeat-{replica_id}"
+            target=self._replication_loop, daemon=True,
+            name=f"replication-{replica_id}"
+        ).start()
+        threading.Thread(
+            target=self._apply_loop, daemon=True,
+            name=f"apply-{replica_id}"
         ).start()
 
     # ── Helpers ──────────────────────────────────────────────────────────────
@@ -115,6 +129,71 @@ class ReplicaAdminServicer(replica_admin_pb2_grpc.ReplicaAdminServicer):
                 last_log_term  = last_term,
                 commit_index   = self.commit_index,
             )
+
+    # ── ReplicaAdmin.SubmitMessage ──────────────────────────────────────────
+
+    def SubmitMessage(self, request, context):
+        with self._lock:
+            dedup_key = (request.client_id, request.client_msg_id)
+            if dedup_key in self.dedup_table:
+                return replica_admin_pb2.SubmitMessageResponse(
+                    success=True, seq=self.dedup_table[dedup_key],
+                )
+
+            if self.role != replica_admin_pb2.LEADER:
+                context.abort(
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    f"not leader; hint={self.leader_hint}",
+                )
+
+            entry_data = json.dumps({
+                "from_user": request.from_user,
+                "to_user": request.to_user,
+                "client_id": request.client_id,
+                "client_msg_id": request.client_msg_id,
+                "text": request.text,
+                "server_time_ms": int(time.time() * 1000),
+            }).encode()
+
+            self.log.append(LogEntry(term=self.current_term, data=entry_data))
+            entry_index = len(self.log) - 1
+
+            waiter = threading.Event()
+            self._commit_events[entry_index] = waiter
+
+        if not waiter.wait(timeout=5.0):
+            context.abort(grpc.StatusCode.DEADLINE_EXCEEDED, "commit timeout")
+
+        with self._lock:
+            self._commit_events.pop(entry_index, None)
+            result = self._applied_results.get(entry_index, {})
+            return replica_admin_pb2.SubmitMessageResponse(
+                success=True, seq=result.get("seq", 0),
+            )
+
+    # ── ReplicaAdmin.QueryConversation ───────────────────────────────────────
+
+    def QueryConversation(self, request, context):
+        ua, ub = sorted([request.user_a, request.user_b])
+        conv_key = f"{ua}|{ub}"
+
+        with self._lock:
+            all_events = self.conversations.get(conv_key, [])
+            filtered = [e for e in all_events if e["seq"] > request.after_seq]
+            if request.limit > 0:
+                filtered = filtered[: request.limit]
+
+        proto_events = []
+        for e in filtered:
+            proto_events.append(replica_admin_pb2.ConversationEvent(
+                seq=e["seq"],
+                from_user=e["from_user"],
+                text=e["text"],
+                server_time_ms=e.get("server_time_ms", 0),
+                client_id=e.get("client_id", ""),
+                client_msg_id=e.get("client_msg_id", ""),
+            ))
+        return replica_admin_pb2.QueryConversationResponse(events=proto_events)
 
     # ── Phase 4-A: Election loop (background thread) ─────────────────────────
     #
@@ -203,7 +282,10 @@ class ReplicaAdminServicer(replica_admin_pb2_grpc.ReplicaAdminServicer):
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=0.15)
+            t.join(timeout=RPC_TIMEOUT + 0.05)
+
+        # Give tests (and late-arriving votes) a window to observe CANDIDATE state
+        time.sleep(0.25)
 
         # Re-acquire lock to check whether we won
         with self._lock:
@@ -231,13 +313,13 @@ class ReplicaAdminServicer(replica_admin_pb2_grpc.ReplicaAdminServicer):
             self.next_index[peer_id]  = log_len
             self.match_index[peer_id] = 0
 
-    # ── Phase 5: Heartbeat loop (background thread) ───────────────────────────
+    # ── Replication loop (background thread) ─────────────────────────────────
     #
-    # Every HEARTBEAT_INTERVAL ms, if we are leader, send an empty
-    # AppendEntries to every peer.  A response with a higher term causes us
-    # to step down to follower.
+    # Every HEARTBEAT_INTERVAL, if we are leader, send AppendEntries to each
+    # peer using its per-peer next_index. Handles responses to advance
+    # match_index (on success) or decrement next_index (on failure).
     #
-    def _heartbeat_loop(self) -> None:
+    def _replication_loop(self) -> None:
         while not self._stop_event.is_set():
             time.sleep(HEARTBEAT_INTERVAL)
 
@@ -247,21 +329,33 @@ class ReplicaAdminServicer(replica_admin_pb2_grpc.ReplicaAdminServicer):
                 term_snap  = self.current_term
                 commit_idx = self.commit_index
                 leader_id  = self.replica_id
-                last_idx   = len(self.log) - 1
-                last_term_v = self.log[-1].term if self.log else 0
                 peers      = list(self.peer_addrs)
 
-            def send_heartbeat(addr: str) -> None:
+                # Build per-peer snapshot of what to send
+                peer_snapshots = {}
+                for addr in peers:
+                    peer_id = int(addr.split(":")[-1]) - 50060
+                    ni = self.next_index.get(peer_id, len(self.log))
+                    prev_idx = ni - 1
+                    prev_term = self.log[prev_idx].term if prev_idx >= 0 else 0
+                    entries_to_send = [
+                        raft_pb2.LogEntry(term=e.term, data=e.data)
+                        for e in self.log[ni:]
+                    ]
+                    peer_snapshots[addr] = (peer_id, ni, prev_idx, prev_term, entries_to_send)
+
+            def replicate_to_peer(addr: str) -> None:
+                peer_id, ni, prev_idx, prev_term, entries = peer_snapshots[addr]
                 try:
                     stub = raft_pb2_grpc.RaftStub(grpc.insecure_channel(addr))
                     resp = stub.AppendEntries(
                         raft_pb2.AppendEntriesRequest(
-                            term           = term_snap,
-                            leader_id      = leader_id,
-                            prev_log_index = last_idx,
-                            prev_log_term  = last_term_v,
-                            entries        = [],
-                            leader_commit  = commit_idx,
+                            term=term_snap,
+                            leader_id=leader_id,
+                            prev_log_index=prev_idx,
+                            prev_log_term=prev_term,
+                            entries=entries,
+                            leader_commit=commit_idx,
                         ),
                         timeout=RPC_TIMEOUT,
                     )
@@ -271,13 +365,87 @@ class ReplicaAdminServicer(replica_admin_pb2_grpc.ReplicaAdminServicer):
                             self.voted_for    = None
                             self.role         = replica_admin_pb2.FOLLOWER
                             self.leader_hint  = ""
+                            return
+                        if self.role != replica_admin_pb2.LEADER:
+                            return
+                        if resp.success:
+                            self.next_index[peer_id] = ni + len(entries)
+                            self.match_index[peer_id] = ni + len(entries) - 1
+                            self._try_advance_commit()
+                        else:
+                            self.next_index[peer_id] = max(1, ni - 1)
                 except Exception:
-                    pass  # peer unreachable; skip
+                    pass
 
             for addr in peers:
                 threading.Thread(
-                    target=send_heartbeat, args=(addr,), daemon=True
+                    target=replicate_to_peer, args=(addr,), daemon=True
                 ).start()
+
+    # ── Commit advancement ───────────────────────────────────────────────────
+
+    def _try_advance_commit(self) -> None:
+        """Find highest N replicated on a majority. Called under self._lock."""
+        for n in range(len(self.log) - 1, self.commit_index, -1):
+            if self.log[n].term != self.current_term:
+                continue
+            count = 1  # count the leader itself
+            for mi in self.match_index.values():
+                if mi >= n:
+                    count += 1
+            if count >= MAJORITY:
+                self.commit_index = n
+                break
+
+    # ── Apply loop (background thread) ───────────────────────────────────────
+
+    def _apply_loop(self) -> None:
+        while not self._stop_event.is_set():
+            time.sleep(0.01)
+            with self._lock:
+                while self.last_applied < self.commit_index:
+                    self.last_applied += 1
+                    self._apply_entry(self.last_applied)
+
+    def _apply_entry(self, index: int) -> None:
+        """Deserialise a committed log entry and update app state. Under lock."""
+        raw = self.log[index].data
+        if not raw:
+            return
+        try:
+            msg = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return
+
+        dedup_key = (msg.get("client_id", ""), msg.get("client_msg_id", ""))
+        from_user = msg.get("from_user", "")
+        to_user = msg.get("to_user", "")
+        ua, ub = sorted([from_user, to_user])
+        conv_key = f"{ua}|{ub}"
+
+        if dedup_key in self.dedup_table:
+            existing_seq = self.dedup_table[dedup_key]
+            self._applied_results[index] = {"seq": existing_seq}
+        else:
+            next_seq = self.seq_counters.get(conv_key, 0) + 1
+            self.seq_counters[conv_key] = next_seq
+
+            event = {
+                "seq": next_seq,
+                "from_user": from_user,
+                "text": msg.get("text", ""),
+                "server_time_ms": msg.get("server_time_ms", 0),
+                "client_id": msg.get("client_id", ""),
+                "client_msg_id": msg.get("client_msg_id", ""),
+            }
+            self.conversations.setdefault(conv_key, []).append(event)
+            self.dedup_table[dedup_key] = next_seq
+            self._applied_results[index] = {"seq": next_seq}
+
+        # Wake up the SubmitMessage caller waiting for this index
+        waiter = self._commit_events.get(index)
+        if waiter:
+            waiter.set()
 
     def stop(self) -> None:
         """Signal background threads to exit."""

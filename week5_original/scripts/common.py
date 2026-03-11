@@ -67,7 +67,7 @@ def best_effort_stop_pid(pid: Any) -> None:
     if not isinstance(pid, int):
         return
     try:
-        os.kill(pid, signal.SIGKILL)
+        os.kill(pid, signal.SIGTERM)
     except OSError:
         pass
 
