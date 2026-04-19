@@ -15,15 +15,28 @@ def build_partition_key(application_name: str, operation_name: str, payload: dic
     selected application's workload and explain the tradeoffs in
     student_impl/README.md.
     """
-    item_id = payload.get("item_id")
-    if item_id is not None:
-        return str(item_id)
-    
-    for field in ("reservation_id", "account_id", "section_id", "id"):
+    if application_name == "inventory":
+        value = payload.get("item_id")
+        if value is not None:
+            return str(value)
+        
+    elif application_name == "course_registration":
+        value = payload.get("section_id") or payload.get("student_id")
+        if value is not None:
+            return str(value)
+        
+    elif application_name == "wallet":
+        value = (payload.get("from_account_id")
+                 or payload.get("account_id")
+                 or payload.get("to_account_id"))
+        if value is not None:
+            return str(value)
+        
+    for field in ("reservation_id", "account_id", "section_id", "from_account_id", "to_account_id","student_id"):
         value = payload.get(field)
         if value is not None:
             return str(value)
-
+    
     return f"{application_name}:{operation_name}"
 
 def choose_logical_shard(partition_key: str, total_logical_shards: int = TOTAL_LOGICAL_SHARDS) -> int:
