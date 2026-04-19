@@ -19,7 +19,7 @@ def build_partition_key(application_name: str, operation_name: str, payload: dic
         value = payload.get("item_id")
         if value is not None:
             return str(value)
-           
+        
     for field in ("reservation_id", "account_id", "section_id", "from_account_id", "to_account_id","student_id"):
         value = payload.get(field)
         if value is not None:
