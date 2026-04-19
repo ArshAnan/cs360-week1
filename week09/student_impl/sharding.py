@@ -19,19 +19,7 @@ def build_partition_key(application_name: str, operation_name: str, payload: dic
         value = payload.get("item_id")
         if value is not None:
             return str(value)
-        
-    elif application_name == "course_registration":
-        value = payload.get("section_id") or payload.get("student_id")
-        if value is not None:
-            return str(value)
-        
-    elif application_name == "wallet":
-        value = (payload.get("from_account_id")
-                 or payload.get("account_id")
-                 or payload.get("to_account_id"))
-        if value is not None:
-            return str(value)
-        
+           
     for field in ("reservation_id", "account_id", "section_id", "from_account_id", "to_account_id","student_id"):
         value = payload.get(field)
         if value is not None:
@@ -46,5 +34,7 @@ def choose_logical_shard(partition_key: str, total_logical_shards: int = TOTAL_L
     The tests will check that your sharding function spreads a representative
     set of keys relatively evenly across the available logical shards.
     """
+    key = partition_key.encode("utf-8")
+    hash_value = int(hashlib.sha256(key).hexdigest(), 16)
 
-    raise NotImplementedError("Implement choose_logical_shard() in student_impl/sharding.py")
+    return hash_value % total_logical_shards
