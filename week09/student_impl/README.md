@@ -112,7 +112,7 @@ Each shard node:
 - loads durable JSON state for one logical shard before executing a request
 - applies one local transaction against that in-memory state
 - saves the updated shard state with an atomic write pattern using a temp file,
-  `fsync`, and `os.replace`
+   `fsync`, `os.replace`, and parent-directory `fsync`
 
 Because committed state is written to the shard's storage file, committed data
 survives process restarts.
@@ -125,6 +125,23 @@ Recovery is straightforward for this single-shard inventory design:
   each logical shard it owns
 - reservation and item records are reconstructed directly from that durable state
 - operations that failed before the save step leave no committed partial effects
+
+Crash-point behavior for one mutation request:
+
+- crash before `save_logical_shard_state(...)` starts:
+   no durable change is visible after restart
+- crash after temp-file write but before `os.replace(...)`:
+   previous committed shard file remains authoritative after restart
+- crash after `os.replace(...)` and directory `fsync`:
+   the new committed shard state is durable after restart
+
+Coordinator/gateway crash handling:
+
+- the gateway is stateless for inventory operations and does not hold unflushed
+   transaction state
+- if a client retries after a timeout, request outcomes remain safe because shard
+   state is loaded from disk on each request and reservation IDs enforce
+   idempotency for duplicate reserve calls
 
 There is no separate cross-shard transaction log because the selected workload
 does not require cross-shard transactions.
