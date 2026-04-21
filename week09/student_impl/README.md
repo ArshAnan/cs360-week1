@@ -146,9 +146,58 @@ Coordinator/gateway crash handling:
 There is no separate cross-shard transaction log because the selected workload
 does not require cross-shard transactions.
 
+## Retry and idempotency
+
+Client retries after a timeout are a first-class part of the failure model, so
+each mutation is designed to be safe to replay:
+
+- `create_item` is idempotent when the same `(item_id, quantity)` pair is
+  re-sent; a conflicting quantity raises instead of silently overwriting.
+- `reserve_item` is idempotent on `reservation_id`. A retry that presents the
+  same `(item_id, quantity)` returns `committed=True` without mutating state.
+  A retry that presents a different payload for an existing `reservation_id`
+  is rejected to prevent accidental id reuse.
+- `release_reservation` writes a durable tombstone into a
+  `released_reservations` table on the shard before deleting the live
+  reservation record. A later retry for the same `reservation_id` finds the
+  tombstone and returns `committed=True` with the current available quantity,
+  instead of raising "unknown reservation". The tombstone is stored in the
+  same per-shard JSON file that is written through the hardened storage
+  layer, so it survives process restarts.
+- A `reservation_id` that has been released cannot be re-used for a new
+  reservation; `reserve_item` rejects it explicitly.
+
+Together these rules make every supported operation safe to retry after a
+gateway timeout, a shard restart, or any other interruption that leaves the
+client uncertain about the outcome.
+
+## How this is tested
+
+The submission adds three test modules on top of the provided suite:
+
+- `tests/test_recovery.py`
+  Starts the cluster, writes inventory and reservation state, then runs
+  `scripts/stop_cluster.py` followed by `scripts/run_cluster.py` to force a
+  full process restart. After the restart the test reconnects to the same
+  gateway address and asserts that item quantities, reservations, and
+  release tombstones all survived. It also covers in-process retry of a
+  release and rejection of reuse of a released `reservation_id`.
+- `tests/test_concurrency.py`
+  Creates a capacity-1 item and launches 16 threads that race to reserve
+  the last unit. The test asserts exactly one reservation commits and the
+  final reserved and available quantities match, exercising the per-shard
+  lock in `shard_server.StudentShardStoreAdapter`.
+- `tests/test_storage_crash_safety.py`
+  Direct unit tests of the provided storage primitives: missing files load
+  as empty, a stale `.json.tmp` next to a real `.json` does not corrupt the
+  load path, a successful save leaves no orphan temp file, a second save
+  atomically replaces the previous file, and malformed top-level JSON or a
+  non-dict state value is rejected.
+
 ## Known limitations
 
 - Only the `inventory` application is implemented in this submission.
 - The design does not implement distributed commit across multiple shards.
-- There is no special retry-tombstone mechanism for repeated release requests
-  after a successful release.
+- The release tombstone currently grows without bound; a production system
+  would add a background trimming policy keyed by age or by reservation
+  epoch.
