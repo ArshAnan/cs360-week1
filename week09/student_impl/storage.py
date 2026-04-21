@@ -6,6 +6,17 @@ from pathlib import Path
 from typing import Any
 
 
+def _fsync_parent_directory(path: Path) -> None:
+    """
+    Best-effort fsync of the parent directory so rename metadata is durable.
+    """
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def load_logical_shard_state(storage_path: Path) -> dict[str, Any]:
     """
     Load the durable state for a logical shard from disk.
@@ -26,13 +37,19 @@ def save_logical_shard_state(storage_path: Path, state: dict[str, Any]) -> None:
     Persist the logical shard state to disk.
     """
     storage_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not isinstance(state, dict):
+        raise ValueError("Logical shard state must be a dictionary")
+
     temporary_path = storage_path.with_suffix(f"{storage_path.suffix}.tmp")
     payload = json.dumps(state, indent=2, sort_keys=True)
-    with temporary_path.open("w") as handle:
+    with temporary_path.open("w", encoding="utf-8") as handle:
         handle.write(payload)
         handle.flush()
         os.fsync(handle.fileno())
+
     os.replace(temporary_path, storage_path)
+    _fsync_parent_directory(storage_path)
 
 
 def export_logical_shard_state(state: dict[str, Any]) -> dict[str, Any]:
