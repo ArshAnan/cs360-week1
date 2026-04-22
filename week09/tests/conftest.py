@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
 import subprocess
 import sys
 import time
@@ -14,6 +15,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_DIR = ROOT / ".runtime"
+DATA_DIR = RUNTIME_DIR / "data"
 CLUSTER_JSON = RUNTIME_DIR / "cluster.json"
 SCRIPTS_DIR = ROOT / "scripts"
 PROTO_DIR = ROOT / "protos"
@@ -179,6 +181,12 @@ def wait_for_port(addr: str, timeout: float = 10.0):
 def cluster():
     _ensure_scripts_exist()
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    # Shard JSON persists under .runtime/data across process restarts by design.
+    # Clear it before each test's cluster start so reservation tombstones and
+    # items from earlier tests do not leak; recovery tests still keep data when
+    # they call stop_cluster/run_cluster inside the same case (no wipe there).
+    if DATA_DIR.exists():
+        shutil.rmtree(DATA_DIR)
 
     proc = _run([sys.executable, str(SCRIPTS_DIR / "run_cluster.py")], cwd=ROOT, check=False)
     if proc.returncode != 0:

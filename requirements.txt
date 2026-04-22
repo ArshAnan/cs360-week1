@@ -3,9 +3,9 @@ certifi==2026.1.4
 charset-normalizer==3.4.4
 editor==1.7.0
 googleapis-common-protos==1.72.0
-grpcio==1.78.0
-grpcio-status==1.78.0
-grpcio-tools==1.78.0
+grpcio==1.80.0
+grpcio-status==1.80.0
+grpcio-tools==1.80.0
 idna==3.11
 inquirer==3.4.1
 protobuf==6.33.5
