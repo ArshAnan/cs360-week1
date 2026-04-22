@@ -25,12 +25,16 @@ def _clone_state(state: dict[str, Any]) -> dict[str, Any]:
     return json.loads(json.dumps(state))
 
 
-def _inventory_tables(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _inventory_tables(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     inventory = state.setdefault("inventory", {})
     reservations = state.setdefault("reservations", {})
-    if not isinstance(inventory, dict) or not isinstance(reservations, dict):
+    # Tombstone of reservation_ids that have been successfully released.
+    # Keeping them durable lets retried release calls after a timeout
+    # return committed=True instead of raising "unknown reservation".
+    released_reservations = state.setdefault("released_reservations", {})
+    if not all(isinstance(table, dict) for table in (inventory, reservations, released_reservations)):
         raise ValueError("inventory shard state is corrupted")
-    return inventory, reservations
+    return inventory, reservations, released_reservations
 
 
 def _available_quantity(item_record: dict[str, Any]) -> int:
@@ -84,7 +88,7 @@ def apply_local_mutation(state: dict[str, Any], operation_name: str, payload: di
     JSON-serializable result.
     """
     working_state = _clone_state(state)
-    inventory, reservations = _inventory_tables(working_state)
+    inventory, reservations, released_reservations = _inventory_tables(working_state)
 
     if operation_name == "create_item":
         item_id = str(payload["item_id"])
@@ -134,6 +138,11 @@ def apply_local_mutation(state: dict[str, Any], operation_name: str, payload: di
                 "remaining_quantity": _available_quantity(item_record),
             }
 
+        if reservation_id in released_reservations:
+            raise ValueError(
+                f"reservation {reservation_id!r} has already been released and cannot be reused"
+            )
+
         if _available_quantity(item_record) < quantity:
             raise ValueError(f"not enough available inventory for {item_id!r}")
 
@@ -157,6 +166,21 @@ def apply_local_mutation(state: dict[str, Any], operation_name: str, payload: di
 
         existing_reservation = reservations.get(reservation_id)
         if existing_reservation is None:
+            # Retry-after-success is safe: if this reservation_id was
+            # already released, short-circuit and return committed=True.
+            tombstone = released_reservations.get(reservation_id)
+            if tombstone is not None:
+                if str(tombstone.get("item_id")) != item_id:
+                    raise ValueError(
+                        f"reservation {reservation_id!r} does not belong to item {item_id!r}"
+                    )
+                item_record = inventory.get(item_id)
+                if item_record is None:
+                    raise ValueError(f"inventory item {item_id!r} is missing")
+                return {
+                    "committed": True,
+                    "remaining_quantity": _available_quantity(item_record),
+                }
             raise ValueError(f"unknown reservation {reservation_id!r}")
         if str(existing_reservation.get("item_id")) != item_id:
             raise ValueError(f"reservation {reservation_id!r} does not belong to item {item_id!r}")
@@ -171,6 +195,11 @@ def apply_local_mutation(state: dict[str, Any], operation_name: str, payload: di
             raise ValueError(f"inventory item {item_id!r} has invalid reserved quantity")
 
         item_record["reserved_quantity"] = new_reserved_quantity
+        released_reservations[reservation_id] = {
+            "reservation_id": reservation_id,
+            "item_id": item_id,
+            "quantity": quantity,
+        }
         del reservations[reservation_id]
 
         state.clear()
@@ -188,7 +217,7 @@ def run_local_query(state: dict[str, Any], query_name: str, payload: dict[str, A
     Execute a single-shard read against local shard state and return a
     JSON-serializable result.
     """
-    inventory, _ = _inventory_tables(state)
+    inventory, _, _ = _inventory_tables(state)
 
     if query_name == "get_inventory":
         item_id = str(payload["item_id"])

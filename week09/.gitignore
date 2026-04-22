@@ -1,0 +1,13 @@
+# Runtime artifacts produced by run_cluster.py / pytest / grpc_tools.protoc.
+# These are regenerated on every run and must not be committed; committing
+# them causes stale test fixtures and cross-machine conflicts.
+.runtime/
+
+# Python bytecode and editable-install metadata
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local editor / OS noise
+.DS_Store
+*.log
