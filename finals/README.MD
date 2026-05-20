@@ -31,8 +31,9 @@ The current submission includes the completed sections listed below. The remaini
 | --- | --- | --- | --- |
 | The Control Plane: Metadata Scaling & Sharding | Stephanie Mata | [stephanie_mata_the_control_plane.md](stephanie_mata_the_control_plane.md) | Complete |
 | Sync Engine & Conflict Resolution: The Client Interface | Arsh Anand | [arsh_anand_sync_engine_and_conflict_resolution.md](arsh_anand_sync_engine_and_conflict_resolution.md) | Complete |
-| The Data Plane: Block Storage & Integrity | Arnav Deepaware | [Arnav_Deepaware_SRE_observability.md](Arnav_Deepaware_SRE_observability.md) | Complete |
-| System Degradation & Chaos Testing: The SRE | TBD | TBD | Pending |
+| The Data Plane: Block Storage & Integrity | TBD | TBD | Pending |
+| System Degradation & Chaos Testing: The SRE | Arnav Deepaware | [Arnav_Deepaware_SRE_observability.md](Arnav_Deepaware_SRE_observability.md) | Complete |
+
 
 ## Presentation Notes
 
@@ -44,7 +45,7 @@ The current submission includes the completed sections listed below. The remaini
 ## Final Submission Checklist
 
 - Add the Data Plane Markdown file.
-- Add the SRE Markdown file.
+- Add the SRE Markdown file. (complete)
 - Replace the `TBD` rows above with the correct names and links.
 - Confirm all filenames use relative links that work from this README.
 - Make sure the final design document reads as one cohesive system rather than four unrelated sections.
