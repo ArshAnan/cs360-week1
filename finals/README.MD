@@ -31,7 +31,7 @@ The current submission includes the completed sections listed below. The remaini
 | --- | --- | --- | --- |
 | The Control Plane: Metadata Scaling & Sharding | Stephanie Mata | [stephanie_mata_the_control_plane.md](stephanie_mata_the_control_plane.md) | Complete |
 | Sync Engine & Conflict Resolution: The Client Interface | Arsh Anand | [arsh_anand_sync_engine_and_conflict_resolution.md](arsh_anand_sync_engine_and_conflict_resolution.md) | Complete |
-| The Data Plane: Block Storage & Integrity | TBD | TBD | Pending |
+| The Data Plane: Block Storage & Integrity | Arnav Deepaware | [Arnav_Deepaware_SRE_observability.md](Arnav_Deepaware_SRE_observability.md) | Complete |
 | System Degradation & Chaos Testing: The SRE | TBD | TBD | Pending |
 
 ## Presentation Notes
